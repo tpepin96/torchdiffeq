@@ -1,24 +1,27 @@
-"""parametric_dataset
+"""parametric_dataset.py
 
 Provides:
-    Parametric shape functions f(t) --> (x,y)
-        Where t = int, float, or 1D np.array
-     - snake, trefoil, rose, torus, spiral, logspiral
-    gen(f, t0 = 0, t1 = 2*np.pi, dt = 0.001, noise_std = 0)
-    vis(sample)
-    vg(f)
-    R(deg, use_radians)
-    rotate(sample, deg)
-    translate(sample, T)
+    10 parametric shape functions,
+    gen(f), vis(g), vg(f) helper functions (for quick experimentation/testing),
+    R(deg, use_radians), rotate(sample, deg), translate(sample, T) for augmentation,
+    generate_sample(f) to generate an augmented sample,
+    generate_true_dataset() to generate smooth shape functions,
+    generate_train_dataset() to noisily `observe' a true_dataset,
+    generate_parametric() wrapper that provides the output necessary for latent_ode,
+    generate_spirals_nonaugmented(), generate_spirals_nonaugmented_small(),
+        and generate_spirals_augmented() as additional wrappers for use in experiments.
+    sanity_check() and quicktest() for quick testing of datasets.
 """
 import matplotlib.pyplot as plt
 import numpy as np
 from math import cos, sin
 
+# some constants to work with
 NUMSAMPLES = 10000  # Number of training example shapes
 RESOLUTION = 1000   # Resolution of training (i.e. number of points per shape)
 NUMOBSERVE = 500    # Number of training observations per shape. (<= RESOLUTION)
 
+#### Primitive shapes
 def snake(t, f = 2):
     # f: Number of oscillations per 2pi*t travelled
     return np.array([np.cos(f*t), t])
@@ -29,6 +32,10 @@ def trefoil(t):
 
 def rose(t, k = 7):
     # k = number of petals if odd, else = number of petals / 2
+    if k % 2 == 1:
+        return np.array([np.cos(k*t/2)*np.cos(t/2),
+                         np.cos(k*t/2)*np.sin(t/2)])
+    # else
     return np.array([np.cos(k*t)*np.cos(t),
                      np.cos(k*t)*np.sin(t)])
 
@@ -55,7 +62,7 @@ def logspiral(t, a=1, b=.1759, r = 3):
     # a = scale
     # b = speed of exponential growth
     l = a*np.exp(b*r*t)
-    return np.array([l*np.cos(r*t), l*np.sin(r*t)])
+    return np.array([-l*np.cos(r*t), l*np.sin(r*t)])
 
 def spirograph(t, a = 11, b = 6):
     # a, b are spirograph parameters
@@ -63,9 +70,6 @@ def spirograph(t, a = 11, b = 6):
     return np.array([a*np.cos(t*b) - b*np.cos(a*t),
                      a*np.sin(t*b) - b*np.sin(a*t)])
 
-
-# shape_functions: Simply a list of the above functions, as functions of t.
-#                  Useful to iterate over.
 shape_functions = [snake,
                    trefoil,
                    lambda t : rose(t,k=7),
@@ -77,7 +81,7 @@ shape_functions = [snake,
                    logspiral,
                    spirograph]
 
-
+#### Helper functions to generate and visualize
 def gen(f, t0 = 0, t1 = 2*np.pi, dt = 0.001):
     '''gen
     # Arguments:
@@ -103,7 +107,7 @@ def vg(f):
     # Convenience function for visualizing a shape
     vis(gen(f))
 
-# Augmentors
+#### Data augmentation
 def R(deg, use_radians=False):
     # Get rotation matrix in radians
     if use_radians:
@@ -117,7 +121,7 @@ def rotate(sample, deg):
 def translate(sample, T):
     return sample + T
 
-
+#### Dataset generating helpers
 def generate_sample(f, res = RESOLUTION, rotation_augment = True, trans_augment_std = 1, shape_functions=shape_functions):
     """Generate a single training example using function f
     
@@ -142,19 +146,24 @@ def generate_sample(f, res = RESOLUTION, rotation_augment = True, trans_augment_
     data_sample = data_sample + [np.random.normal(scale=trans_augment_std), np.random.normal(scale=trans_augment_std)]
     return data_sample
 
-# Generate our dataset...
-def generate_true_dataset(nsamples=NUMSAMPLES, rotation_augment = True, trans_augment_std = .2):
+def generate_true_dataset(nsamples=NUMSAMPLES,
+                          res=RESOLUTION,
+                          rotation_augment=True,
+                          trans_augment_std = .2,
+                          shape_functions=shape_functions):
     """Generate the "true" / training dataset.
     rotation_augment: bool. If true, randomly rotate each shape.
     trans_augment_std: real, translation standard deviation
     """
     labels = np.array([np.random.randint(len(shape_functions)) for _ in range(nsamples)])
     return np.stack([generate_sample(f = shape_functions[label],
+                                     res = res,
                                      rotation_augment = rotation_augment, 
-                                     trans_augment_std = trans_augment_std)
+                                     trans_augment_std = trans_augment_std,
+                                     shape_functions = shape_functions)
                      for label in labels]), labels
 
-def generate_train_dataset(dataset, subsize=NUMOBSERVE, start=200, std = 2**-7):
+def generate_train_dataset(dataset, subsize=NUMOBSERVE, start=200, std = 2**-6):
     """ Generate a training dataset.
     dataset: As returned by generate_true_dataset.
              dataset.shape = (nsamples, resolution, 2), e.g. (10000, 1000, 2)
@@ -168,8 +177,7 @@ def generate_train_dataset(dataset, subsize=NUMOBSERVE, start=200, std = 2**-7):
     # Given a dataset of true values (as generated by generate_true_dataset),
     # return a dataset of samples with time values 200:700,
     # plus gaussian noise with standard deviation std.
-    # create a local copy of the dataset to work with.
-    dataset = np.array(dataset)
+    dataset = np.array(dataset) # creates a local copy
     if start == "random" or start == "random-nowrap":
         res = dataset.shape[1]
         if start == "random-nowrap":
@@ -180,25 +188,85 @@ def generate_train_dataset(dataset, subsize=NUMOBSERVE, start=200, std = 2**-7):
                                          shift = -np.random.randint(low=0,high=res-1),
                                          axis = 0)
         start = 0
-    return np.random.normal(dataset.take(range(start,start+subsize),
-                                         mode="wrap",
-                                         axis=1),
-                            scale=2**-7)
+    
+    train_dataset = dataset.take(range(start,start+subsize),
+                                 mode="wrap",
+                                 axis=1)
+    return np.random.normal(train_dataset, scale=std)
 
-def generate_parametric2d():
-    # Just use this as a drop-in replacement for 'generate spiral 2d'
-    # Take care to look for the labels
-    print("Generating dataset")
-    dataset, labels = generate_true_dataset()
-    print("    Generating training dataset")
-    train_dataset = generate_train_dataset(dataset, std = 2**-7)
-    print("    Almost done...")
-    # orig_ts, samp_ts are produced ad-hoc here. Heads up!
-    # don't rely on it to be valid if you change any code above...
+#### These are the functions you're looking for
+def generate_parametric(NUMSAMPLES=500,
+                        RESOLUTION=200,
+                        NUMOBSERVE=100,
+                        START=50,
+                        shape_functions=shape_functions,
+                        rotation_augment=True,
+                        trans_augment_std=.1):
+    dataset, labels = \
+        generate_true_dataset(nsamples=NUMSAMPLES,
+                              res=RESOLUTION,
+                              shape_functions=shape_functions,
+                              rotation_augment=rotation_augment,
+                              trans_augment_std = trans_augment_std)
+    train_dataset = generate_train_dataset(dataset,
+                                           start = START,
+                                           subsize=NUMOBSERVE,
+                                           std = 2**-7)
     dt = 2*np.pi/RESOLUTION
     orig_ts = np.arange(0, 2*np.pi, dt)
-    samp_ts = orig_ts[200:700]
-    print("    ...Done!")
-    
+    samp_ts = orig_ts[START:START+NUMOBSERVE]
     return dataset, train_dataset, orig_ts, samp_ts, labels
 
+# Functions used in experiment 1, 2, 3
+def generate_spirals_nonaugmented():
+    return generate_parametric(NUMSAMPLES = 1000,
+                               RESOLUTION = 500,
+                               NUMOBSERVE = 250,
+                               START = 50,
+                               shape_functions=[spiral, logspiral],
+                               rotation_augment=False,
+                               trans_augment_std = 0)
+
+def generate_spirals_augmented():
+    return generate_parametric(NUMSAMPLES = 200,
+                               RESOLUTION = 100,
+                               NUMOBSERVE = 50,
+                               START = 20,
+                               shape_functions=[spiral, logspiral],
+                               rotation_augment=True,
+                               trans_augment_std = .25)
+
+
+def generate_spirals_nonaugmented_small():
+    return generate_parametric(NUMSAMPLES = 100,
+                               RESOLUTION = 50,
+                               NUMOBSERVE = 25,
+                               START = 5,
+                               shape_functions=[spiral, logspiral],
+                               rotation_augment=False,
+                               trans_augment_std = 0)    
+
+#### Testing
+def sanity_test(dataset, train_dataset, orig_ts, samp_ts, labels, nvis = 4):
+    print("Quick sanity check on dataset...")
+    for arr in [dataset, train_dataset, orig_ts, samp_ts, labels]:
+        print(arr.shape)
+    
+    assert dataset.shape[0] == train_dataset.shape[0] == labels.shape[0]
+    assert dataset.shape[1] == orig_ts.shape[0]
+    assert train_dataset.shape[1] == samp_ts.shape[0]
+    assert samp_ts.shape[0] <= orig_ts.shape[0]
+    
+    for ii in range(nvis):
+        for d in [dataset, train_dataset]:
+            vis(d[ii])
+    
+    print("All good :)")
+
+def quicktest():
+    sanity_test(*generate_spirals_nonaugmented(), nvis=4)
+    sanity_test(*generate_spirals_augmented(), nvis=4)
+    sanity_test(*generate_parametric(), nvis=20)
+
+if __name__ == "__main__":
+    quicktest()
